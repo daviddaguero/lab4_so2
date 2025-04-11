@@ -42,7 +42,12 @@ SECTIONS
         _etext = .;
     } > FLASH
 
-    .data : AT (ADDR(.text) + SIZEOF(.text))
+    .ARM.exidx : 
+    {
+        *(.ARM.exidx*)
+    } > FLASH
+
+    .data : AT (ADDR(.ARM.exidx) + SIZEOF(.ARM.exidx))
     {
         _data = .;
         *(vtable)

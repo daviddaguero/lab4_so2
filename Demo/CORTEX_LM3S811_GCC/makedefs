@@ -124,6 +124,8 @@ endif
 # The rule for building the object file from each C source file.
 #
 #******************************************************************************
+$(info COMPILER = ${COMPILER})
+
 ${COMPILER}/%.o: %.c
 	@if [ 'x${VERBOSE}' = x ];                               \
 	 then                                                    \

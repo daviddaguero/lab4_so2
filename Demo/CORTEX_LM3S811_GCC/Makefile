@@ -77,9 +77,3 @@ ENTRY_RTOSDemo=ResetISR
 # Include the automatically generated dependency files.
 #
 -include ${wildcard ${COMPILER}/*.d} __dummy__
-
-
-	 
-
-
-
