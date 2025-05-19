@@ -1,15 +1,17 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
+#include "semphr.h"
+
+#include <string.h>
 
 /* Environment includes. */
 #include "DriverLib.h"
 
 /* Macros */
-#define mainBAUD_RATE               19200       // Baud rate for serial communication
+#define mainBAUD_RATE               115200      // Baud rate for serial communication
 #define TIMER_LOAD_VALUE            1500        // Initial load value for the timer
 #define TRUE                        1           // Boolean value representing true
-#define FILTER_WINDOW_SIZE          5           // Window size (last N samples)
 #define TASK_DELAY_MS               100         // Delay in milliseconds for task execution    
 #define BUFFER_SIZE                 50          // Buffer size for string formatting
 #define MIN_TEMPERATURE             15          // Minimum temperature value
@@ -28,14 +30,23 @@
 #define INCREMENT                   12345       // Increment added in the generator formula
 #define SHIFT_BITS                  16          // Number of bits to shift for extracting the result
 #define RESULT_MASK                 0x7FFF      // Mask to obtain the 15 least significant bits of the result
+#define MAX_WINDOW_SIZE             10          // Maximum allowed filter window size
+#define MIN_WINDOW_SIZE             2           // Minimum allowed filter window size
+#define INPUT_BUFFER_SIZE           10          // Size of the input buffer for UART reading
+#define STACK_SIZE                  256         // Stack size allocated for task execution (in words)
+// #define UART_RX_QUEUE_SIZE          32
 
 /* Global variables */
 QueueHandle_t xSensorDataQueue;
 QueueHandle_t xFilteredDataQueue;
+// QueueHandle_t xUartRxQueue;
+SemaphoreHandle_t xFilterMutex;
+// SemaphoreHandle_t xUARTMutex;
 unsigned long ulHighFrequencyTimerTicks;
 
 unsigned char ucDisplayBuffer[96 * 2] = {0}; // 96 columns, 2 pages (16px height)
 static unsigned int seed = 12345;           // Pseudoaleatory numbers generator (LCG - Linear Congruential Generator)
+volatile int filter_window_size = 5;        // Window size (last N samples)
 
 /* Function prototypes */
 void Timer0IntHandler( void );
@@ -46,19 +57,32 @@ void vUARTSend(const char *string);
 void formatString(char *buffer, const char *prefix, int value, const char *suffix);
 void setPixel(int x, int y, int on);
 int pseudo_random(void);
+int stringToInt(const char *str);
 
 /* Task prototypes */
 void vSimulateTemperatureSensorTask(void *pvParameters);
 void vLowPassFilterTask(void *pvParameters);
 void vDisplayGraphTask(void *pvParameters);
+void vUARTReaderTask(void *pvParameters);
+
+/**
+ * @brief Handles stack overflow detection in FreeRTOS tasks.
+ *
+ * This function is called automatically when FreeRTOS detects a stack overflow 
+ * in any task. It sends a status character via UART and enters an infinite loop 
+ * to halt execution, preventing further issues caused by the overflow.
+ *
+ * @param xTask Handle to the task that experienced the stack overflow.
+ * @param pcTaskName Pointer to the name of the task that overflowed (null-terminated string).
+ */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+    UARTCharNonBlockingPut(UART0_BASE, 'S');
+    while (TRUE);
+}
 
 void vUART_ISR(void)
 {
-    while (TRUE)
-    {
-        /* code */
-    }
-    
+
 }
 
 /**
@@ -98,7 +122,17 @@ unsigned long ulGetHighFrequencyTimerTicks(void)
 
 int main(void)
 {
-    vUARTSetup();
+    vUARTSetup();  // Configura el UART y habilita las interrupciones
+
+    // xUartRxQueue = xQueueCreate(UART_RX_QUEUE_SIZE, sizeof(char));
+    // if (xUartRxQueue == NULL) {
+    //     vUARTSend("❌ Error al crear xUartRxQueue\n");
+    //     for (;;);
+    // }
+
+    // UARTCharNonBlockingPut(UART0_BASE, 'H');
+    // UARTCharNonBlockingPut(UART0_BASE, 'i');
+    // UARTCharNonBlockingPut(UART0_BASE, '\n');
 
     // Queue to pass temperature values
     xSensorDataQueue = xQueueCreate(QUEUE_LENGTH, sizeof(int));
@@ -114,12 +148,33 @@ int main(void)
         for (;;);
     }
 
+    xFilterMutex = xSemaphoreCreateBinary();
+    if (xFilterMutex == NULL) {
+        vUARTSend("Error: Filter mutex couldn't be created.\n");
+        for(;;);
+    }
+
+    // xUARTMutex = xSemaphoreCreateBinary();
+    // if (xUARTMutex == NULL) {
+    //     vUARTSend("Error: UART mutex couldn't be created.\n");
+    //     for(;;);
+    // }
+
+    xSemaphoreGive(xFilterMutex);
+    // xSemaphoreGive(xUARTMutex);
+
+    vUARTSend("Starting...\n");
+
     OSRAMInit(TRUE);  // Initializes the display with fast speed (400 kbps)
     OSRAMDisplayOn(); // Turn on the display
 
     xTaskCreate(vSimulateTemperatureSensorTask, "TempSensorTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
     xTaskCreate(vLowPassFilterTask, "FilterTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
-    xTaskCreate(vDisplayGraphTask, "GraphTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(vDisplayGraphTask, "GraphTask", STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, NULL);
+    BaseType_t result = xTaskCreate(vUARTReaderTask, "UARTReader", STACK_SIZE, NULL, tskIDLE_PRIORITY + 4, NULL);
+    if (result != pdPASS) {
+        vUARTSend("❌ UARTReaderTask couldn't be created.\n");
+    }
 
     vTaskStartScheduler();
 
@@ -147,12 +202,13 @@ void vSimulateTemperatureSensorTask(void *pvParameters)
 
     while (TRUE)
     {
+        // vUARTSend("En el loop del sensor de temperatura\n");
         int temperature = MIN_TEMPERATURE + (pseudo_random() % (TEMPERATURE_RANGE + 1));  // Between 15 and 35 degrees Celsius
 
         char buffer[BUFFER_SIZE];
-        formatString(buffer, "Temperatura: ", temperature, " °C\n");
+        // formatString(buffer, "Temperatura: ", temperature, " °C\n");
 
-        vUARTSend(buffer);
+        // vUARTSend(buffer);
 
         if (xQueueSend(xSensorDataQueue, &temperature, portMAX_DELAY) != pdPASS) {
             vUARTSend("Error: temperature read couldn't be sent through the queue\n");
@@ -178,13 +234,49 @@ void vLowPassFilterTask(void *pvParameters)
 {
     (void)pvParameters; // Avoid compiler warnings for unused parameter
 
-    int window[FILTER_WINDOW_SIZE] = {0}; // Circular window
+    int current_size;
+    if (xSemaphoreTake(xFilterMutex, portMAX_DELAY)) {
+        current_size = filter_window_size;
+        xSemaphoreGive(xFilterMutex);
+    }
+    int *window = pvPortMalloc(current_size * sizeof(int));
+
     int index = 0; // Current window index
     int sum = 0; // Cumulative sum of the window
     int count = 0; // Number of values ​​processed (for initialization)
 
     while (TRUE)
     {
+        // vUARTSend("En el loop del filtro pasabajos\n");
+        int new_size;
+
+        // Obtener tamaño actual del filtro
+        if (xSemaphoreTake(xFilterMutex, portMAX_DELAY)) {
+            new_size = filter_window_size;
+            xSemaphoreGive(xFilterMutex);
+        }
+
+        // Si el tamaño cambió, realocamos
+        if (new_size != current_size) {
+            if (window != NULL) {
+                vPortFree(window);
+            }
+
+            window = pvPortMalloc(new_size * sizeof(int));
+            if (window == NULL) {
+                vUARTSend("Error: the filter could not be relocated.\n");
+                while (TRUE);
+            }
+
+            memset(window, 0, new_size * sizeof(int));
+            current_size = new_size;
+            index = 0;
+            sum = 0;
+            count = 0;
+
+            vUARTSend("Filter set to new N.\n");
+        }
+
         int temperature;
         char buffer[BUFFER_SIZE];
 
@@ -207,17 +299,17 @@ void vLowPassFilterTask(void *pvParameters)
             // vUARTSend(buffer);
 
             // Advance the index of the circular window
-            index = (index + 1) % FILTER_WINDOW_SIZE;
+            index = (index + 1) % current_size;
 
             // Calculate the average (consider the number of initial values)
-            if (count < FILTER_WINDOW_SIZE) {
+            if (count < current_size) {
                 count++;
             }
             int filteredValue = sum / count;
 
-            formatString(buffer, "Filtered value: ", filteredValue, " °C\n");
+            // formatString(buffer, "Filtered value: ", filteredValue, " °C\n");
 
-            vUARTSend(buffer);
+            // vUARTSend(buffer);
 
             if (xQueueSend(xFilteredDataQueue, &filteredValue, portMAX_DELAY) != pdPASS) {
                 vUARTSend("Error: The filtered value could not be sent to the queue.\n");
@@ -253,6 +345,7 @@ void vDisplayGraphTask(void *pvParameters)
 
     while (TRUE)
     {
+        // vUARTSend("En el loop de graph task\n");
         int value;
         if (xQueueReceive(xFilteredDataQueue, &value, portMAX_DELAY) == pdPASS)
         {
@@ -296,6 +389,65 @@ void vDisplayGraphTask(void *pvParameters)
 }
 
 /**
+ * @brief Task for reading and processing UART input.
+ *
+ * This FreeRTOS task continuously monitors the UART interface, receiving 
+ * and processing incoming characters. It supports numeric input for configuring 
+ * a filter window size, provides user feedback via UART, and handles invalid input gracefully.
+ *
+ * @param pvParameters Pointer to task-specific parameters (unused in this implementation).
+ */
+void vUARTReaderTask(void *pvParameters) {
+    (void)pvParameters;
+
+    char c;
+    char inputBuffer[INPUT_BUFFER_SIZE];
+    int inputIndex = 0;
+
+    // vUARTSend("En el loop de la task UART reader\n");
+    // vTaskDelay(pdMS_TO_TICKS(1000));
+
+    for (;;) {
+        if (UARTCharsAvail(UART0_BASE)) {
+            c = UARTCharGet(UART0_BASE);  // Reads an available character (blocks if none, but we already checked with UARTCharsAvail)
+            UARTCharPut(UART0_BASE, c);   // Direct echo to UART
+
+            if (c >= '0' && c <= '9') {
+                if (inputIndex < sizeof(inputBuffer) - 1) {
+                    inputBuffer[inputIndex++] = c;
+                } else {
+                    inputIndex = 0;
+                    vUARTSend("❗ Very long entry. Try again.\r\n");
+                }
+            } else if (c == '\r' || c == '\n') {
+                vUARTSend("\r\n");
+                inputBuffer[inputIndex] = '\0';
+
+                if (inputIndex > 0) {
+                    int newN = stringToInt(inputBuffer);
+                    if (newN >= MIN_WINDOW_SIZE && newN <= MAX_WINDOW_SIZE) {
+                        filter_window_size = newN;
+                        vUARTSend("✅ Filter now N = ");
+                        vUARTSend(inputBuffer);
+                        vUARTSend("\r\n");
+                    } else {
+                        vUARTSend("❗ Invalid N (2-10).\r\n");
+                    }
+                } else {
+                    vUARTSend("⚠️ Empty buffer.\r\n");
+                }
+                inputIndex = 0;
+            } else {
+                inputIndex = 0;
+                vUARTSend("❗ Non numeric character.\r\n");
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));  // Avoid saturating the CPU if there is no data
+        }
+    }
+}
+
+/**
  * @brief Interrupt handler for Timer0 time-out event.
  *
  * This function is triggered when Timer0 reaches its time-out condition.
@@ -318,11 +470,30 @@ void Timer0IntHandler( void )
  */
 void vUARTSetup(void)
 {
+    IntMasterEnable();
     SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+
+    // Configurar los pines PA0 y PA1 como UART
+    // GPIODirModeSet(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1, GPIO_DIR_MODE_HW);
+    // GPIOPadConfigSet(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1,
+    //                  GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD);
+    
+    GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+
     UARTConfigSet(UART0_BASE, mainBAUD_RATE, (UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE));
-    UARTIntEnable(UART0_BASE, UART_INT_RX);
-    IntPrioritySet(INT_UART0, configKERNEL_INTERRUPT_PRIORITY);
-    IntEnable(INT_UART0);
+    // UARTConfigSetExpClk(UART0_BASE, SysCtlClockGet(), 19200,
+    //                 UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE);
+    // UARTIntRegister(UART0_BASE, vUART_ISR);
+    // UARTFIFOEnable(UART0_BASE);
+    UARTIntDisable(UART0_BASE, UART_INT_RX | UART_INT_RT);
+    UARTIntClear(UART0_BASE, UART_INT_RX | UART_INT_RT);
+
+    // UARTIntEnable(UART0_BASE, UART_INT_RX | UART_INT_RT);
+    // IntPrioritySet(INT_UART0, configKERNEL_INTERRUPT_PRIORITY);
+    // IntEnable(INT_UART0);
+    // Habilitar UART0
+    UARTEnable(UART0_BASE);
 }
 
 /**
@@ -334,10 +505,16 @@ void vUARTSetup(void)
  *
  * @param string Pointer to the null-terminated string to be sent.
  */
-void vUARTSend(const char *string)
-{
-    while (*string)
-    {
+void vUARTSend(const char *string) {
+    // if (xUARTMutex != NULL) {
+    //     if (xSemaphoreTake(xUARTMutex, portMAX_DELAY)) {
+    //         while (*string) {
+    //             UARTCharPut(UART0_BASE, *string++);
+    //         }
+    //         xSemaphoreGive(xUARTMutex);
+    //     }
+    // }
+    while (*string) {
         UARTCharPut(UART0_BASE, *string++);
     }
 }
@@ -453,4 +630,26 @@ int pseudo_random(void)
 {
     seed = seed * MULTIPLIER + INCREMENT; // LCG formula
     return (seed >> SHIFT_BITS) & RESULT_MASK; // Returns a 15 bits number
+}
+
+/**
+ * @brief Converts a numeric string to an integer.
+ *
+ * This function parses a null-terminated string containing numeric characters ('0' to '9') 
+ * and converts it into an integer value. If the string contains any non-numeric characters, 
+ * the function returns an error code (-1).
+ *
+ * @param str Pointer to the null-terminated string representing a numeric value.
+ * @return The converted integer value if the input is valid, or -1 if the string contains non-numeric characters.
+ */
+int stringToInt(const char *str) {
+    int value = 0;
+    while (*str) {
+        if (*str < '0' || *str > '9') {
+            return -1; // Error: non-valid character
+        }
+        value = value * 10 + (*str - '0');
+        str++;
+    }
+    return value;
 }
