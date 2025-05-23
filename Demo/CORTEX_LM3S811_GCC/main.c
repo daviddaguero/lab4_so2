@@ -12,7 +12,9 @@
 #define mainBAUD_RATE               115200      // Baud rate for serial communication
 #define TIMER_LOAD_VALUE            1500        // Initial load value for the timer
 #define TRUE                        1           // Boolean value representing true
-#define TASK_DELAY_MS               100         // Delay in milliseconds for task execution    
+#define DELAY_100_MS                100         // 100 milliseconds delay for task execution   
+#define DELAY_10_MS                 10          // 10 milliseconds delay for task execution 
+#define DELAY_5_SECONDS             5000        // 5 seconds delay for task execution
 #define BUFFER_SIZE                 50          // Buffer size for string formatting
 #define MIN_TEMPERATURE             15          // Minimum temperature value
 #define TEMPERATURE_RANGE           20          // Range of temperature values (35 - 15)
@@ -34,15 +36,17 @@
 #define MIN_WINDOW_SIZE             2           // Minimum allowed filter window size
 #define INPUT_BUFFER_SIZE           10          // Size of the input buffer for UART reading
 #define STACK_SIZE                  256         // Stack size allocated for task execution (in words)
-// #define UART_RX_QUEUE_SIZE          32
 
 /* Global variables */
 QueueHandle_t xSensorDataQueue;
 QueueHandle_t xFilteredDataQueue;
-// QueueHandle_t xUartRxQueue;
 SemaphoreHandle_t xFilterMutex;
-// SemaphoreHandle_t xUARTMutex;
 unsigned long ulHighFrequencyTimerTicks;
+
+TaskHandle_t xTempSensorHandle = NULL;
+TaskHandle_t xFilterHandle = NULL;
+TaskHandle_t xGraphHandle = NULL;
+TaskHandle_t xUARTReaderHandle = NULL;
 
 unsigned char ucDisplayBuffer[96 * 2] = {0}; // 96 columns, 2 pages (16px height)
 static unsigned int seed = 12345;           // Pseudoaleatory numbers generator (LCG - Linear Congruential Generator)
@@ -64,6 +68,7 @@ void vSimulateTemperatureSensorTask(void *pvParameters);
 void vLowPassFilterTask(void *pvParameters);
 void vDisplayGraphTask(void *pvParameters);
 void vUARTReaderTask(void *pvParameters);
+void vMonitorStackTask(void *pvParameters);
 
 /**
  * @brief Handles stack overflow detection in FreeRTOS tasks.
@@ -81,9 +86,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
 }
 
 void vUART_ISR(void)
-{
-
-}
+{}
 
 /**
  * @brief Configures and initializes Timer0 for a 32-bit periodic timer.
@@ -124,16 +127,6 @@ int main(void)
 {
     vUARTSetup();  // Configura el UART y habilita las interrupciones
 
-    // xUartRxQueue = xQueueCreate(UART_RX_QUEUE_SIZE, sizeof(char));
-    // if (xUartRxQueue == NULL) {
-    //     vUARTSend("❌ Error al crear xUartRxQueue\n");
-    //     for (;;);
-    // }
-
-    // UARTCharNonBlockingPut(UART0_BASE, 'H');
-    // UARTCharNonBlockingPut(UART0_BASE, 'i');
-    // UARTCharNonBlockingPut(UART0_BASE, '\n');
-
     // Queue to pass temperature values
     xSensorDataQueue = xQueueCreate(QUEUE_LENGTH, sizeof(int));
     if (xSensorDataQueue == NULL) {
@@ -154,14 +147,7 @@ int main(void)
         for(;;);
     }
 
-    // xUARTMutex = xSemaphoreCreateBinary();
-    // if (xUARTMutex == NULL) {
-    //     vUARTSend("Error: UART mutex couldn't be created.\n");
-    //     for(;;);
-    // }
-
     xSemaphoreGive(xFilterMutex);
-    // xSemaphoreGive(xUARTMutex);
 
     vUARTSend("Starting...\n");
 
@@ -170,11 +156,12 @@ int main(void)
 
     xTaskCreate(vSimulateTemperatureSensorTask, "TempSensorTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
     xTaskCreate(vLowPassFilterTask, "FilterTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
-    xTaskCreate(vDisplayGraphTask, "GraphTask", STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, NULL);
-    BaseType_t result = xTaskCreate(vUARTReaderTask, "UARTReader", STACK_SIZE, NULL, tskIDLE_PRIORITY + 4, NULL);
+    xTaskCreate(vDisplayGraphTask, "GraphTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, NULL);
+    BaseType_t result = xTaskCreate(vUARTReaderTask, "UARTReader", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (result != pdPASS) {
         vUARTSend("❌ UARTReaderTask couldn't be created.\n");
     }
+    xTaskCreate(vMonitorStackTask, "MonitorStack", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
 
     vTaskStartScheduler();
 
@@ -202,20 +189,16 @@ void vSimulateTemperatureSensorTask(void *pvParameters)
 
     while (TRUE)
     {
-        // vUARTSend("En el loop del sensor de temperatura\n");
         int temperature = MIN_TEMPERATURE + (pseudo_random() % (TEMPERATURE_RANGE + 1));  // Between 15 and 35 degrees Celsius
 
         char buffer[BUFFER_SIZE];
-        // formatString(buffer, "Temperatura: ", temperature, " °C\n");
-
-        // vUARTSend(buffer);
 
         if (xQueueSend(xSensorDataQueue, &temperature, portMAX_DELAY) != pdPASS) {
             vUARTSend("Error: temperature read couldn't be sent through the queue\n");
         }
 
         // Delay task to achieve a frequency of 10 Hz (100 ms)
-        vTaskDelay(pdMS_TO_TICKS(TASK_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(DELAY_100_MS));
     }
 }
 
@@ -247,16 +230,15 @@ void vLowPassFilterTask(void *pvParameters)
 
     while (TRUE)
     {
-        // vUARTSend("En el loop del filtro pasabajos\n");
         int new_size;
 
-        // Obtener tamaño actual del filtro
+        // Get current filter size
         if (xSemaphoreTake(xFilterMutex, portMAX_DELAY)) {
             new_size = filter_window_size;
             xSemaphoreGive(xFilterMutex);
         }
 
-        // Si el tamaño cambió, realocamos
+        // If the size changed, we reallocate
         if (new_size != current_size) {
             if (window != NULL) {
                 vPortFree(window);
@@ -281,22 +263,11 @@ void vLowPassFilterTask(void *pvParameters)
         char buffer[BUFFER_SIZE];
 
         if (xQueueReceive(xSensorDataQueue, &temperature, portMAX_DELAY) == pdPASS) {
-            // formatString(buffer, "Temperatura recibida: ", temperature, " °C\n");
-            // vUARTSend(buffer);
             // Adjust the current cumulative sum by removing the oldest value and adding the new one
             sum -= window[index];
-            // formatString(buffer, "sum: ", sum, "\n");
-            // vUARTSend(buffer);
             window[index] = temperature;
-            // for (size_t i = 0; i < FILTER_WINDOW_SIZE; i++)
-            // {
-            //     formatString(buffer, "window[index]: ", window[i], "\n");
-            //     vUARTSend(buffer);
-            // }
             
             sum += temperature;
-            // formatString(buffer, "sum: ", sum, "\n");
-            // vUARTSend(buffer);
 
             // Advance the index of the circular window
             index = (index + 1) % current_size;
@@ -306,10 +277,6 @@ void vLowPassFilterTask(void *pvParameters)
                 count++;
             }
             int filteredValue = sum / count;
-
-            // formatString(buffer, "Filtered value: ", filteredValue, " °C\n");
-
-            // vUARTSend(buffer);
 
             if (xQueueSend(xFilteredDataQueue, &filteredValue, portMAX_DELAY) != pdPASS) {
                 vUARTSend("Error: The filtered value could not be sent to the queue.\n");
@@ -345,7 +312,6 @@ void vDisplayGraphTask(void *pvParameters)
 
     while (TRUE)
     {
-        // vUARTSend("En el loop de graph task\n");
         int value;
         if (xQueueReceive(xFilteredDataQueue, &value, portMAX_DELAY) == pdPASS)
         {
@@ -384,7 +350,7 @@ void vDisplayGraphTask(void *pvParameters)
             formatString(buffer, "T: ", value, "C");
             OSRAMStringDraw(buffer, IMAGE_X_START, IMAGE_Y_START);
         }
-        vTaskDelay(pdMS_TO_TICKS(TASK_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(DELAY_100_MS));
     }
 }
 
@@ -403,9 +369,6 @@ void vUARTReaderTask(void *pvParameters) {
     char c;
     char inputBuffer[INPUT_BUFFER_SIZE];
     int inputIndex = 0;
-
-    // vUARTSend("En el loop de la task UART reader\n");
-    // vTaskDelay(pdMS_TO_TICKS(1000));
 
     for (;;) {
         if (UARTCharsAvail(UART0_BASE)) {
@@ -442,8 +405,44 @@ void vUARTReaderTask(void *pvParameters) {
                 vUARTSend("❗ Non numeric character.\r\n");
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(10));  // Avoid saturating the CPU if there is no data
+            vTaskDelay(pdMS_TO_TICKS(DELAY_10_MS));  // Avoid saturating the CPU if there is no data
         }
+    }
+}
+
+/**
+ * @brief Monitors the stack usage of various FreeRTOS tasks.
+ *
+ * This FreeRTOS task periodically retrieves and reports the stack high water mark 
+ * for multiple tasks, providing insights into stack consumption and potential overflow risks.
+ *
+ * @param pvParameters Pointer to task-specific parameters (unused in this implementation).
+ */
+void vMonitorStackTask(void *pvParameters)
+{
+    (void)pvParameters;
+    char buffer[BUFFER_SIZE];
+
+    while (TRUE)
+    {
+        UBaseType_t stackTemp = uxTaskGetStackHighWaterMark(xTempSensorHandle);
+        UBaseType_t stackFilter = uxTaskGetStackHighWaterMark(xFilterHandle);
+        UBaseType_t stackGraph = uxTaskGetStackHighWaterMark(xGraphHandle);
+        UBaseType_t stackUART = uxTaskGetStackHighWaterMark(xUARTReaderHandle);
+
+        formatString(buffer, "TempSensor HWM: ", stackTemp, "\n");
+        vUARTSend(buffer);
+
+        formatString(buffer, "FilterTask HWM: ", stackFilter, "\n");
+        vUARTSend(buffer);
+
+        formatString(buffer, "GraphTask HWM: ", stackGraph, "\n");
+        vUARTSend(buffer);
+
+        formatString(buffer, "UARTReader HWM: ", stackUART, "\n");
+        vUARTSend(buffer);
+
+        vTaskDelay(pdMS_TO_TICKS(DELAY_5_SECONDS)); // every 5 seconds
     }
 }
 
@@ -473,26 +472,12 @@ void vUARTSetup(void)
     IntMasterEnable();
     SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
-
-    // Configurar los pines PA0 y PA1 como UART
-    // GPIODirModeSet(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1, GPIO_DIR_MODE_HW);
-    // GPIOPadConfigSet(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1,
-    //                  GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD);
     
     GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
 
     UARTConfigSet(UART0_BASE, mainBAUD_RATE, (UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE));
-    // UARTConfigSetExpClk(UART0_BASE, SysCtlClockGet(), 19200,
-    //                 UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE);
-    // UARTIntRegister(UART0_BASE, vUART_ISR);
-    // UARTFIFOEnable(UART0_BASE);
     UARTIntDisable(UART0_BASE, UART_INT_RX | UART_INT_RT);
     UARTIntClear(UART0_BASE, UART_INT_RX | UART_INT_RT);
-
-    // UARTIntEnable(UART0_BASE, UART_INT_RX | UART_INT_RT);
-    // IntPrioritySet(INT_UART0, configKERNEL_INTERRUPT_PRIORITY);
-    // IntEnable(INT_UART0);
-    // Habilitar UART0
     UARTEnable(UART0_BASE);
 }
 
@@ -506,14 +491,6 @@ void vUARTSetup(void)
  * @param string Pointer to the null-terminated string to be sent.
  */
 void vUARTSend(const char *string) {
-    // if (xUARTMutex != NULL) {
-    //     if (xSemaphoreTake(xUARTMutex, portMAX_DELAY)) {
-    //         while (*string) {
-    //             UARTCharPut(UART0_BASE, *string++);
-    //         }
-    //         xSemaphoreGive(xUARTMutex);
-    //     }
-    // }
     while (*string) {
         UARTCharPut(UART0_BASE, *string++);
     }
