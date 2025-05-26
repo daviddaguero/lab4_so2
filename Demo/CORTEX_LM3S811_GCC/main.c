@@ -1,3 +1,4 @@
+/* FreeRTOS includes. */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -35,7 +36,14 @@
 #define MAX_WINDOW_SIZE             10          // Maximum allowed filter window size
 #define MIN_WINDOW_SIZE             2           // Minimum allowed filter window size
 #define INPUT_BUFFER_SIZE           10          // Size of the input buffer for UART reading
-#define STACK_SIZE                  256         // Stack size allocated for task execution (in words)
+#define STACK_SIZE_TEMP_SENSOR      96          // Stack size for the temperature sensor simulation task
+#define STACK_SIZE_FILTER           96          // Stack size for the low-pass filter processing task
+#define STACK_SIZE_GRAPH            96          // Stack size for the graph display task
+#define STACK_SIZE_UART_READER      96          // Stack size for the UART reader task
+#define STACK_SIZE_MONITOR_STACK    64          // Stack size for the stack monitoring task
+#define BUFFER_SIZE_STATS           128         // Buffer size for task statistics formatting
+#define BASE_DECIMAL                10          // Base 10 for converting numerical values to string representation
+#define BUFFER_SIZE_TEMP            16          // Buffer size for temporary string storage
 
 /* Global variables */
 QueueHandle_t xSensorDataQueue;
@@ -62,6 +70,8 @@ void formatString(char *buffer, const char *prefix, int value, const char *suffi
 void setPixel(int x, int y, int on);
 int pseudo_random(void);
 int stringToInt(const char *str);
+void formatTaskStats(char *buffer, TaskStatus_t *task, uint32_t totalRunTime);
+char *utoa(unsigned int value, char *str, int base);
 
 /* Task prototypes */
 void vSimulateTemperatureSensorTask(void *pvParameters);
@@ -69,6 +79,7 @@ void vLowPassFilterTask(void *pvParameters);
 void vDisplayGraphTask(void *pvParameters);
 void vUARTReaderTask(void *pvParameters);
 void vMonitorStackTask(void *pvParameters);
+void vTopLikeTask(void *pvParameters);
 
 /**
  * @brief Handles stack overflow detection in FreeRTOS tasks.
@@ -125,7 +136,7 @@ unsigned long ulGetHighFrequencyTimerTicks(void)
 
 int main(void)
 {
-    vUARTSetup();  // Configura el UART y habilita las interrupciones
+    vUARTSetup();  // Configures UART and enables interrupts.
 
     // Queue to pass temperature values
     xSensorDataQueue = xQueueCreate(QUEUE_LENGTH, sizeof(int));
@@ -135,18 +146,21 @@ int main(void)
         for (;;);
     }
 
+    // Queue to pass filtered values
     xFilteredDataQueue = xQueueCreate(QUEUE_LENGTH, sizeof(int));
     if (xFilteredDataQueue == NULL) {
         vUARTSend("Error: Could not create queue for filtered values.\n");
         for (;;);
     }
 
+    // Mutex for accessing the filter window size
     xFilterMutex = xSemaphoreCreateBinary();
     if (xFilterMutex == NULL) {
         vUARTSend("Error: Filter mutex couldn't be created.\n");
         for(;;);
     }
 
+    // Initialize the filter mutex
     xSemaphoreGive(xFilterMutex);
 
     vUARTSend("Starting...\n");
@@ -154,14 +168,15 @@ int main(void)
     OSRAMInit(TRUE);  // Initializes the display with fast speed (400 kbps)
     OSRAMDisplayOn(); // Turn on the display
 
-    xTaskCreate(vSimulateTemperatureSensorTask, "TempSensorTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
-    xTaskCreate(vLowPassFilterTask, "FilterTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL);
-    xTaskCreate(vDisplayGraphTask, "GraphTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, NULL);
-    BaseType_t result = xTaskCreate(vUARTReaderTask, "UARTReader", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 4, NULL);
+    xTaskCreate(vSimulateTemperatureSensorTask, "TempSensorTask", STACK_SIZE_TEMP_SENSOR, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(vLowPassFilterTask, "FilterTask", STACK_SIZE_FILTER, NULL, tskIDLE_PRIORITY + 2, NULL);
+    xTaskCreate(vDisplayGraphTask, "GraphTask", STACK_SIZE_GRAPH, NULL, tskIDLE_PRIORITY + 3, NULL);
+    BaseType_t result = xTaskCreate(vUARTReaderTask, "UARTReader", STACK_SIZE_UART_READER, NULL, tskIDLE_PRIORITY + 4, NULL);
     if (result != pdPASS) {
         vUARTSend("❌ UARTReaderTask couldn't be created.\n");
     }
-    xTaskCreate(vMonitorStackTask, "MonitorStack", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(vMonitorStackTask, "MonitorStack", STACK_SIZE_MONITOR_STACK, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(vTopLikeTask, "TopTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL);
 
     vTaskStartScheduler();
 
@@ -222,7 +237,8 @@ void vLowPassFilterTask(void *pvParameters)
         current_size = filter_window_size;
         xSemaphoreGive(xFilterMutex);
     }
-    int *window = pvPortMalloc(current_size * sizeof(int));
+    // int *window = pvPortMalloc(current_size * sizeof(int));
+    int *window = pvPortMalloc(MAX_WINDOW_SIZE * sizeof(int));
 
     int index = 0; // Current window index
     int sum = 0; // Cumulative sum of the window
@@ -240,23 +256,13 @@ void vLowPassFilterTask(void *pvParameters)
 
         // If the size changed, we reallocate
         if (new_size != current_size) {
-            if (window != NULL) {
-                vPortFree(window);
-            }
-
-            window = pvPortMalloc(new_size * sizeof(int));
-            if (window == NULL) {
-                vUARTSend("Error: the filter could not be relocated.\n");
-                while (TRUE);
-            }
-
-            memset(window, 0, new_size * sizeof(int));
             current_size = new_size;
             index = 0;
             sum = 0;
             count = 0;
-
-            vUARTSend("Filter set to new N.\n");
+            memset(window, 0, MAX_WINDOW_SIZE * sizeof(int));
+            
+            vUARTSend("\nFilter set to new N.\n");
         }
 
         int temperature;
@@ -279,7 +285,7 @@ void vLowPassFilterTask(void *pvParameters)
             int filteredValue = sum / count;
 
             if (xQueueSend(xFilteredDataQueue, &filteredValue, portMAX_DELAY) != pdPASS) {
-                vUARTSend("Error: The filtered value could not be sent to the queue.\n");
+                vUARTSend("\nError: The filtered value could not be sent to the queue.\n");
             }
         }
     }
@@ -380,7 +386,7 @@ void vUARTReaderTask(void *pvParameters) {
                     inputBuffer[inputIndex++] = c;
                 } else {
                     inputIndex = 0;
-                    vUARTSend("❗ Very long entry. Try again.\r\n");
+                    vUARTSend("\n❗ Very long entry. Try again.\r\n");
                 }
             } else if (c == '\r' || c == '\n') {
                 vUARTSend("\r\n");
@@ -390,19 +396,19 @@ void vUARTReaderTask(void *pvParameters) {
                     int newN = stringToInt(inputBuffer);
                     if (newN >= MIN_WINDOW_SIZE && newN <= MAX_WINDOW_SIZE) {
                         filter_window_size = newN;
-                        vUARTSend("✅ Filter now N = ");
+                        vUARTSend("\n✅ Filter now N = ");
                         vUARTSend(inputBuffer);
                         vUARTSend("\r\n");
                     } else {
-                        vUARTSend("❗ Invalid N (2-10).\r\n");
+                        vUARTSend("\n❗ Invalid N (2-10).\r\n");
                     }
                 } else {
-                    vUARTSend("⚠️ Empty buffer.\r\n");
+                    vUARTSend("\n⚠️ Empty buffer.\r\n");
                 }
                 inputIndex = 0;
             } else {
                 inputIndex = 0;
-                vUARTSend("❗ Non numeric character.\r\n");
+                vUARTSend("\n❗ Non numeric character.\r\n");
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(DELAY_10_MS));  // Avoid saturating the CPU if there is no data
@@ -430,6 +436,8 @@ void vMonitorStackTask(void *pvParameters)
         UBaseType_t stackGraph = uxTaskGetStackHighWaterMark(xGraphHandle);
         UBaseType_t stackUART = uxTaskGetStackHighWaterMark(xUARTReaderHandle);
 
+        vUARTSend("\n📊 Stack High Water Marks:\n");
+
         formatString(buffer, "TempSensor HWM: ", stackTemp, "\n");
         vUARTSend(buffer);
 
@@ -445,6 +453,67 @@ void vMonitorStackTask(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(DELAY_5_SECONDS)); // every 5 seconds
     }
 }
+
+/**
+ * @brief Monitors system tasks, tracks free heap space, and logs task statistics.
+ *
+ * This task periodically retrieves system task statuses, monitors heap usage,
+ * and reports statistics via UART. If the number of tasks increases, it dynamically
+ * resizes the task status array.
+ *
+ * @param pvParameters Unused parameter, maintained for FreeRTOS compliance.
+ */
+void vTopLikeTask(void *pvParameters)
+{
+    TaskStatus_t *pxTaskStatusArray;
+    static UBaseType_t uxMaxTasks = 0;
+
+    UBaseType_t uxArraySize, x;
+    uint32_t ulTotalRunTime;
+    char buffer[BUFFER_SIZE_STATS];  
+
+    while (TRUE)
+    {
+        uxArraySize = uxTaskGetNumberOfTasks();
+
+        utoa(xPortGetFreeHeapSize(), buffer, BASE_DECIMAL);
+        vUARTSend("\n📉 Free Heap: ");
+        vUARTSend(buffer);
+        vUARTSend("\n");
+
+        if (uxArraySize > uxMaxTasks)
+        {
+            // Resize only if there are more tasks than before
+            if (pxTaskStatusArray != NULL)
+                vPortFree(pxTaskStatusArray);
+
+            pxTaskStatusArray = pvPortMalloc(uxArraySize * sizeof(TaskStatus_t));
+
+            if (pxTaskStatusArray != NULL)
+                uxMaxTasks = uxArraySize;
+            else
+            {
+                vUARTSend("❌ Could not allocate memory for pxTaskStatusArray\n");
+                vTaskDelay(pdMS_TO_TICKS(DELAY_5_SECONDS));
+                continue;
+            }
+        }
+
+        uxArraySize = uxTaskGetSystemState(pxTaskStatusArray, uxArraySize, &ulTotalRunTime);
+
+        vUARTSend("\n🔍 Task Stats:\n");
+
+        for (x = 0; x < uxArraySize; x++)
+        {
+            formatTaskStats(buffer, &pxTaskStatusArray[x], ulTotalRunTime);
+            vUARTSend(buffer);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(DELAY_5_SECONDS));
+    }
+}
+
+/* ------------------------------------- Functions --------------------------------------------- */
 
 /**
  * @brief Interrupt handler for Timer0 time-out event.
@@ -629,4 +698,88 @@ int stringToInt(const char *str) {
         str++;
     }
     return value;
+}
+
+/**
+ * @brief Formats and stores task statistics in a buffer.
+ *
+ * This function generates a formatted string containing details about a FreeRTOS task,
+ * including its name, CPU usage percentage, available stack space, and current state.
+ * The formatted output is stored in the provided buffer for further transmission or logging.
+ *
+ * @param buffer Pointer to a character array where the formatted statistics will be stored.
+ * @param task Pointer to the TaskStatus_t structure containing information about the task.
+ * @param totalRunTime Total runtime of all tasks, used to compute CPU usage percentage.
+ */
+void formatTaskStats(char *buffer, TaskStatus_t *task, uint32_t totalRunTime) {
+    char temp[BUFFER_SIZE_TEMP];
+    uint32_t cpu = 0;
+
+    buffer[0] = '\0';  // Clear buffer
+
+    strcat(buffer, "📌 Name: ");
+    strcat(buffer, task->pcTaskName);
+
+    strcat(buffer, " | CPU: ");
+
+    if (totalRunTime > 0) {
+        cpu = (task->ulRunTimeCounter * 100UL) / totalRunTime;
+    }
+
+    utoa(cpu, temp, BASE_DECIMAL);  // Convert number to string
+    strcat(buffer, temp);
+
+    strcat(buffer, "% | Stack Free: ");
+    utoa(task->usStackHighWaterMark, temp, BASE_DECIMAL);
+    strcat(buffer, temp);
+
+    strcat(buffer, " | State: ");
+    utoa(task->eCurrentState, temp, BASE_DECIMAL);
+    strcat(buffer, temp);
+
+    strcat(buffer, "\n");
+}
+
+/**
+ * @brief Converts an unsigned integer to a string representation in the specified base.
+ *
+ * This function converts a given unsigned integer into a null-terminated string
+ * using the specified numerical base (between 2 and 16). The conversion is done
+ * in reverse order, and the result is stored in the provided buffer.
+ *
+ * @param value The unsigned integer to convert.
+ * @param str Pointer to a character array where the converted string will be stored.
+ * @param base Numerical base for conversion (valid range: 2 to 16).
+ * @return Pointer to the resulting string buffer.
+ */
+char *utoa(unsigned int value, char *str, int base) {
+    char *ptr = str;
+    char *ptr1 = str;
+    char tmp_char;
+    unsigned int tmp_value;
+
+    // Only valid bases
+    if (base < 2 || base > 16) {
+        // Invalid base, return empty string
+        *str = '\0';
+        return str;
+    }
+
+    // Convert number to string in reverse order.
+    do {
+        tmp_value = value;
+        value /= base;
+        *ptr++ = "0123456789ABCDEF"[tmp_value % base];
+    } while (value);
+
+    // End string
+    *ptr-- = '\0';
+
+    // Invert string (because we built it backwards)
+    while (ptr1 < ptr) {
+        tmp_char = *ptr;
+        *ptr-- = *ptr1;
+        *ptr1++ = tmp_char;
+    }
+    return str;
 }
