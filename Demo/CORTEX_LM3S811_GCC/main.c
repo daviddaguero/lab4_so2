@@ -48,7 +48,6 @@
 /* Global variables */
 QueueHandle_t xSensorDataQueue;
 QueueHandle_t xFilteredDataQueue;
-SemaphoreHandle_t xFilterMutex;
 unsigned long ulHighFrequencyTimerTicks;
 
 TaskHandle_t xTempSensorHandle = NULL;
@@ -153,16 +152,6 @@ int main(void)
         for (;;);
     }
 
-    // Mutex for accessing the filter window size
-    xFilterMutex = xSemaphoreCreateBinary();
-    if (xFilterMutex == NULL) {
-        vUARTSend("Error: Filter mutex couldn't be created.\n");
-        for(;;);
-    }
-
-    // Initialize the filter mutex
-    xSemaphoreGive(xFilterMutex);
-
     vUARTSend("Starting...\n");
 
     OSRAMInit(TRUE);  // Initializes the display with fast speed (400 kbps)
@@ -232,12 +221,7 @@ void vLowPassFilterTask(void *pvParameters)
 {
     (void)pvParameters; // Avoid compiler warnings for unused parameter
 
-    int current_size;
-    if (xSemaphoreTake(xFilterMutex, portMAX_DELAY)) {
-        current_size = filter_window_size;
-        xSemaphoreGive(xFilterMutex);
-    }
-    // int *window = pvPortMalloc(current_size * sizeof(int));
+    int current_size = filter_window_size;
     int *window = pvPortMalloc(MAX_WINDOW_SIZE * sizeof(int));
 
     int index = 0; // Current window index
@@ -249,10 +233,7 @@ void vLowPassFilterTask(void *pvParameters)
         int new_size;
 
         // Get current filter size
-        if (xSemaphoreTake(xFilterMutex, portMAX_DELAY)) {
-            new_size = filter_window_size;
-            xSemaphoreGive(xFilterMutex);
-        }
+        new_size = filter_window_size;
 
         // If the size changed, we reallocate
         if (new_size != current_size) {

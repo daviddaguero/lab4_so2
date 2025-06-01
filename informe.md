@@ -27,7 +27,7 @@ To smooth out variations in sensor readings, the **`vLowPassFilterTask`** mainta
 
 A **moving average algorithm** processes the buffered values to refine the temperature readings, and the filtered values are then transmitted to **`xFilteredDataQueue`** for visualization.  
 
-**Real-time configurability:** The value of **N** (the filter window size) can be adjusted dynamically via **UART commands**. This functionality is safeguarded using **`xFilterMutex`**, ensuring that simultaneous access by multiple tasks does not cause inconsistencies.
+**Real-time configurability:** The value of **N** (the filter window size) can be adjusted dynamically via **UART commands**. 
 
 ### **Graphical Data Display**
 
@@ -59,19 +59,17 @@ The **`vTopLikeTask`** mimics the functionality of the **Linux `top` command**, 
 - Remaining stack space  
 - Task states  
 
+These statistics are displayed periodically via UART, allowing real-time monitoring through the serial interface.
+
 Additionally, heap usage is monitored via **`xPortGetFreeHeapSize()`**, ensuring that memory consumption remains within safe limits. The task dynamically adjusts memory allocation using **`pvPortMalloc()`**, resizing only if required.
 
 ### **Stack Overflow Detection**
 
 A **dedicated exception handler**, **`vApplicationStackOverflowHook()`**, is implemented to detect stack overflows. If an overflow occurs, the system sends an **'S' character** via UART before halting execution, enabling prompt identification of failure points.
 
-## **Synchronization and Memory Management**
-
-To maintain system integrity, **mutex protection (`xFilterMutex`)** ensures that only one task can modify **`filter_window_size`** at a given time, preventing data corruption due to simultaneous access. Furthermore, dynamic memory management strategies minimize fragmentation and prevent memory leaks.
-
 ## **Debugging and Simulation Environment**
 
-The project has been extensively **tested within QEMU**, utilizing UART output as a primary debugging interface. Observing task behavior and monitoring filtered temperature values through UART has enabled rigorous validation of system performance.
+The project has been extensively **tested within QEMU**, utilizing UART output as a primary debugging interface. Observing task behavior and monitoring filtered temperature values through UART enabled rigorous validation of system performance during development. However, UART prints related to temperature and filter size were removed from the final version to avoid excessive output that could obscure the task statistics displayed by the vTopLikeTask.
 
 ## **Sequence Diagram**
 
@@ -105,8 +103,13 @@ sequenceDiagram
     
     Main ->> UART: Start UART Reader Task
     UART ->> UART: Read User Input (Filter Size 2-10)
-    UART ->> Filter: Update Filter Window Size (Protected by Mutex)
-    
+    alt If Input received
+        alt Valid input (numeric, 2–10)
+            UART ->> Filter: Update Filter Window Size
+        else Invalid input
+            UART ->> UART: Send Error Message
+        end
+    end
     Main ->> Monitor: Start Stack Monitoring
     Monitor ->> Monitor: Check Stack Usage Every 5s
     Monitor ->> Monitor: Send Report via UART
@@ -117,11 +120,13 @@ sequenceDiagram
     
     Main ->> Overflow: Start Overflow Detection
     Overflow ->> Overflow: Detect Stack Overflows
-    Overflow ->> Overflow: Send "S" via UART & Halt System
+    alt If overflow detected
+        Overflow ->> Overflow: Send "S" via UART & Halt System
+    end
 ```
 
 ## **Conclusion**
 
-This project effectively demonstrates multitasking capabilities in an embedded environment, with robust **inter-task communication mechanisms** utilizing **queues and semaphores**. The system provides **real-time data visualization and interactive parameter tuning**, ensuring flexibility while operating within constrained hardware resources.
+This project effectively demonstrates multitasking capabilities in an embedded environment, with robust **inter-task communication mechanisms** utilizing **queues**. The system provides **real-time data visualization and interactive parameter tuning**, ensuring flexibility while operating within constrained hardware resources.
 
 Particular emphasis has been placed on **memory efficiency, stack integrity, and system diagnostics**, ensuring a **reliable, optimized, and transparent** embedded solution.
